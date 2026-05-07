@@ -64,6 +64,10 @@ Output formats:
   - sarif: SARIF format for security tool integration
   - cbom:  Cryptographic Bill of Materials
 
+Multiple formats can be specified as a comma-separated list
+(e.g., --format json,cbom). When using multiple formats, each
+format is written to a separate file automatically.
+
 CI/CD Integration:
   --ignore              Suppress specific pattern IDs (e.g., "RSA-001,CERT-*")
   --ignore-category     Suppress entire categories (e.g., "Certificate,Library Import")
@@ -81,6 +85,8 @@ Examples:
   cryptoscan scan /path/to/project
   cryptoscan scan https://github.com/org/repo
   cryptoscan scan . --format json --output findings.json
+  cryptoscan scan . --format json,cbom --output results.json
+  cryptoscan scan . --format json,cbom,sarif
   cryptoscan scan . --include "*.java,*.py" --exclude "vendor/*,test/*"
 
   # CI/CD examples
@@ -93,8 +99,8 @@ Examples:
 }
 
 func init() {
-	scanCmd.Flags().StringVarP(&outputFormat, "format", "f", "text", "Output format: text, json, csv, sarif, cbom")
-	scanCmd.Flags().StringVarP(&outputFile, "output", "o", "", "Output file (default: stdout)")
+	scanCmd.Flags().StringVarP(&outputFormat, "format", "f", "text", "Output format: text, json, csv, sarif, cbom (comma-separated for multiple formats)")
+	scanCmd.Flags().StringVarP(&outputFile, "output", "o", "", "Output file (default: stdout; with multiple formats, used as base name)")
 	scanCmd.Flags().StringVarP(&includeGlobs, "include", "i", "", "File patterns to include (comma-separated)")
 	scanCmd.Flags().StringVarP(&excludeGlobs, "exclude", "e", "", "File patterns to exclude (comma-separated)")
 	scanCmd.Flags().IntVarP(&maxDepth, "max-depth", "d", 0, "Maximum directory depth (0 = unlimited)")
@@ -116,6 +122,45 @@ func init() {
 	scanCmd.Flags().StringVar(&failOn, "fail-on", "", "Exit non-zero if findings at this severity or higher (info, low, medium, high, critical)")
 	scanCmd.Flags().StringVar(&baselineFile, "baseline", "", "Baseline JSON file - only report new findings")
 	scanCmd.Flags().StringVar(&configFile, "config", "", "Config file path (default: auto-detect .cryptoscan.yaml)")
+}
+
+// createReporter creates the appropriate reporter for the given format string
+func createReporter(format string) (reporter.Reporter, error) {
+	switch format {
+	case "json":
+		return reporter.NewJSONReporter(jsonPretty), nil
+	case "csv":
+		return reporter.NewCSVReporter(), nil
+	case "sarif":
+		return reporter.NewSARIFReporter(), nil
+	case "cbom":
+		return reporter.NewCBOMReporter(), nil
+	case "text":
+		textRep := reporter.NewTextReporter(!noColor)
+		textRep.SetGroupBy(groupBy)
+		return textRep, nil
+	default:
+		return nil, fmt.Errorf("unsupported output format: %s", format)
+	}
+}
+
+// outputFileForFormat generates an output filename for a given format.
+// If a base output file is provided, it inserts the format name before the extension.
+// If no output file is provided, it uses "cryptoscan-<format>.json" (or .txt for text).
+func outputFileForFormat(baseFile, format string) string {
+	ext := "json"
+	if format == "text" {
+		ext = "txt"
+	}
+	if baseFile != "" {
+		// Insert format name before the extension
+		dir := filepath.Dir(baseFile)
+		base := filepath.Base(baseFile)
+		extOrig := filepath.Ext(base)
+		nameWithoutExt := strings.TrimSuffix(base, extOrig)
+		return filepath.Join(dir, nameWithoutExt+"-"+format+extOrig)
+	}
+	return "cryptoscan-" + format + "." + ext
 }
 
 func runScan(cmd *cobra.Command, args []string) error {
@@ -305,21 +350,10 @@ func runScan(cmd *cobra.Command, args []string) error {
 		results.MigrationScore = analyzer.CalculateMigrationScore(results.Findings)
 	}
 
-	// Create reporter
-	var rep reporter.Reporter
-	switch outputFormat {
-	case "json":
-		rep = reporter.NewJSONReporter(jsonPretty)
-	case "csv":
-		rep = reporter.NewCSVReporter()
-	case "sarif":
-		rep = reporter.NewSARIFReporter()
-	case "cbom":
-		rep = reporter.NewCBOMReporter()
-	default:
-		textRep := reporter.NewTextReporter(!noColor)
-		textRep.SetGroupBy(groupBy)
-		rep = textRep
+	// Parse comma-separated output formats
+	formats := strings.Split(outputFormat, ",")
+	for i := range formats {
+		formats[i] = strings.TrimSpace(formats[i])
 	}
 
 	// Add metadata
@@ -327,22 +361,54 @@ func runScan(cmd *cobra.Command, args []string) error {
 	results.ScanTarget = target
 	results.ScanTime = startTime
 
-	// Generate report
-	report, err := rep.Generate(results)
-	if err != nil {
-		return fmt.Errorf("failed to generate report: %w", err)
-	}
-
-	// Output
-	if outputFile != "" {
-		if err := os.WriteFile(outputFile, []byte(report), 0644); err != nil {
-			return fmt.Errorf("failed to write output: %w", err)
+	// Generate and output reports for each format
+	if len(formats) > 1 {
+		// Multiple formats: write each to its own file
+		// Default to pretty-print JSON when writing to files
+		if !jsonPretty {
+			jsonPretty = true
 		}
-		if outputFormat == "text" {
-			fmt.Printf("\nReport written to: %s\n", outputFile)
+		for _, format := range formats {
+			rep, err := createReporter(format)
+			if err != nil {
+				return err
+			}
+
+			report, err := rep.Generate(results)
+			if err != nil {
+				return fmt.Errorf("failed to generate %s report: %w", format, err)
+			}
+
+			// Determine output file for this format
+			formatFile := outputFileForFormat(outputFile, format)
+			if err := os.WriteFile(formatFile, []byte(report), 0644); err != nil {
+				return fmt.Errorf("failed to write %s output: %w", format, err)
+			}
+			fmt.Printf("  %s report written to: %s\n", format, formatFile)
 		}
 	} else {
-		fmt.Println(report)
+		// Single format: use existing behavior
+		format := formats[0]
+		rep, err := createReporter(format)
+		if err != nil {
+			return err
+		}
+
+		report, err := rep.Generate(results)
+		if err != nil {
+			return fmt.Errorf("failed to generate report: %w", err)
+		}
+
+		if outputFile != "" {
+			if err := os.WriteFile(outputFile, []byte(report), 0644); err != nil {
+				return fmt.Errorf("failed to write output: %w", err)
+			}
+			if format == "text" {
+				fmt.Printf("\nReport written to: %s\n", outputFile)
+			}
+		} else {
+			fmt.Println(report)
+		}
 	}
 
 	// Exit code control based on --fail-on flag
